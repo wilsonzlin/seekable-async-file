@@ -2,8 +2,6 @@
 
 This library will provide a `SeekableAsyncFile` struct that is designed to be similar in function to [tokio::fs::File](https://docs.rs/tokio/latest/tokio/fs/struct.File.html). It provides async `read_at` and `write_at` methods, which aren't currently available with Tokio.
 
-The target platform must support [std::os::unix::fs::FileExt](https://doc.rust-lang.org/std/os/unix/fs/trait.FileExt.html).
-
 ## Getting started
 
 Add it to your project like:
@@ -24,12 +22,24 @@ If this is used, make sure to also execute the `start_delayed_data_sync_backgrou
 
 Metrics will be populated via the `SeekableAsyncFileMetrics` struct. All values are atomic, so it's possible to read them at any time from any thread safely using the provided getter methods. This is designed for use inside a larger system (e.g. database, object storage, cache) or I/O subsystem.
 
+## Modes
+
+### mmap (default)
+
+By default, a memory map is created on the file. This means that all platforms that support mmap can be targeted, instead of only Unix platforms with `pread` and `pwrite`.
+
+### tokio_file
+
+Enabling the `tokio_file` feature will cause `pread` and `pwrite` on standard file descriptors to be used instead of mmap. Ensure to disable the `mmap` feature, which is enabled by default.
+
+The target platform must support [std::os::unix::fs::FileExt](https://doc.rust-lang.org/std/os/unix/fs/trait.FileExt.html).
+
 ## Features
 
 For experimental purposes, there are other Cargo features that can be toggled:
 
 - **fsync_delayed**: (Default) Delay calls to `fdatasync` when using `write_at_with_delayed_sync`.
 - **fsync_immediate**: Immediately call `fdatasync`, even from `write_at_with_delayed_sync`. The `start_delayed_data_sync_background_loop` method does nothing.
-- **mmap**: Use mmap instead of `pread` and `pwrite`.
-- **tokio_file**: (Default) Use `pread` and `pwrite` with `tokio::spawn_blocking`.
+- **mmap**: (Default) Use mmap instead of `pread` and `pwrite`.
+- **tokio_file**: Use `pread` and `pwrite` with `tokio::spawn_blocking`.
 - **unsafe_fsync_none**: (UNSAFE) Never call `fdatasync`, even when expected to.

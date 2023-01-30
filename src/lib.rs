@@ -1,5 +1,4 @@
 use std::future::Future;
-use std::os::unix::prelude::FileExt;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -16,7 +15,13 @@ use tokio::task::spawn_blocking;
 use tokio::time::Instant;
 use tokio::time::sleep;
 
+#[cfg(feature = "tokio_file")]
+use {
+  std::os::unix::prelude::FileExt
+};
+
 // Use this over `as usize` for safety without verbosity of `.try_into::<usize>().unwrap()`.
+#[allow(unused_macros)]
 macro_rules! as_usize {
   ($v:expr) => {{
     let v: usize = $v.try_into().unwrap();
@@ -118,13 +123,14 @@ impl Future for PendingSyncFuture {
 impl SeekableAsyncFile {
   /// Open a file descriptor in read and write modes, creating it if it doesn't exist. If it already exists, the contents won't be truncated.
   ///
-  /// To save a `stat` call, the size must be provided. This also allows opening non-standard files which may have a size of zero (e.g. block devices). If the mmap feature is being used, a different size value also allows only using a portion of the beginning of the file.
+  /// If the mmap feature is being used, to save a `stat` call, the size must be provided. This also allows opening non-standard files which may have a size of zero (e.g. block devices). A different size value also allows only using a portion of the beginning of the file.
   ///
   /// The `io_direct` and `io_dsync` parameters set the `O_DIRECT` and `O_DSYNC` flags, respectively. Unless you need those flags, provide `false`.
   ///
   /// Make sure to execute `start_delayed_data_sync_background_loop` in the background after this call.
   pub async fn open(
     path: &Path,
+    #[cfg(feature = "mmap")]
     size: u64,
     metrics: Arc<SeekableAsyncFileMetrics>,
     #[cfg(feature = "fsync_delayed")]
