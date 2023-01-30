@@ -33,6 +33,7 @@ fn dur_us(dur: Instant) -> u64 {
   dur.elapsed().as_micros().try_into().unwrap()
 }
 
+/// Data to write and the offset to write it at. This is provided to `write_at_with_delayed_sync`.
 pub struct WriteRequest {
   pub data: Vec<u8>,
   pub offset: u64,
@@ -81,10 +82,12 @@ impl SeekableAsyncFileMetrics {
   pub fn write_us_counter(&self) -> u64 { self.write_us_counter.load(Ordering::Relaxed) }
 }
 
-// Tokio has still not implemented read_at and write_at: https://github.com/tokio-rs/tokio/issues/1529. We need these to be able to share a file descriptor across threads (e.g. use from within async function).
-// Apparently spawn_blocking is how Tokio does all file operations (as not all platforms have native async I/O), so our use is not worse but not optimised for async I/O either.
+
+/// A `File`-like value that can perform async `read_at` and `write_at` for I/O at specific offsets without mutating any state (i.e. is thread safe). Metrics are collected, and syncs can be delayed for write batching opportunities as a performance optimisation.
 #[derive(Clone)]
 pub struct SeekableAsyncFile {
+  // Tokio has still not implemented read_at and write_at: https://github.com/tokio-rs/tokio/issues/1529. We need these to be able to share a file descriptor across threads (e.g. use from within async function).
+  // Apparently spawn_blocking is how Tokio does all file operations (as not all platforms have native async I/O), so our use is not worse but not optimised for async I/O either.
   #[cfg(feature = "tokio_file")]
   fd: Arc<std::fs::File>,
   #[cfg(feature = "mmap")]

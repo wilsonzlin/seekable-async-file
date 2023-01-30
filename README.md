@@ -40,6 +40,6 @@ For experimental purposes, there are other Cargo features that can be toggled:
 
 - **fsync_delayed**: (Default) Delay calls to `fdatasync` when using `write_at_with_delayed_sync`.
 - **fsync_immediate**: Immediately call `fdatasync`, even from `write_at_with_delayed_sync`. The `start_delayed_data_sync_background_loop` method does nothing.
+- **unsafe_fsync_none**: (UNSAFE) Never call `fdatasync`, even when expected to.
 - **mmap**: (Default) Use mmap instead of `pread` and `pwrite`.
 - **tokio_file**: Use `pread` and `pwrite` with `tokio::spawn_blocking`.
-- **unsafe_fsync_none**: (UNSAFE) Never call `fdatasync`, even when expected to.
