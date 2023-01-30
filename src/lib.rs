@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
+use std::time::Duration;
 use tokio::fs::OpenOptions;
 use tokio::spawn;
 use tokio::sync::Mutex;
@@ -86,7 +87,7 @@ pub struct SeekableAsyncFile {
   #[cfg(feature = "mmap")]
   mmap_len: usize,
   #[cfg(feature = "fsync_delayed")]
-  delayed_sync_us: u64,
+  sync_delay_us: u64,
   metrics: Arc<SeekableAsyncFileMetrics>,
   pending_sync_state: Arc<Mutex<PendingSyncState>>,
 }
@@ -127,7 +128,7 @@ impl SeekableAsyncFile {
     size: u64,
     metrics: Arc<SeekableAsyncFileMetrics>,
     #[cfg(feature = "fsync_delayed")]
-    delayed_sync_us: u64,
+    sync_delay: Duration,
     io_direct: bool,
     io_dsync: bool,
   ) -> Self {
@@ -157,7 +158,7 @@ impl SeekableAsyncFile {
       #[cfg(feature = "mmap")]
       mmap_len: as_usize!(size),
       #[cfg(feature = "fsync_delayed")]
-      delayed_sync_us,
+      sync_delay_us: sync_delay.as_micros().try_into().unwrap(),
       metrics,
       pending_sync_state: Arc::new(Mutex::new(PendingSyncState {
         earliest_unsynced: None,
@@ -271,7 +272,7 @@ impl SeekableAsyncFile {
   pub async fn start_delayed_data_sync_background_loop(&self) {
     let mut futures_to_wake = Vec::new();
     loop {
-      sleep(std::time::Duration::from_micros(self.delayed_sync_us)).await;
+      sleep(std::time::Duration::from_micros(self.sync_delay_us)).await;
 
       struct SyncNow {
         longest_delay_us: u64,

@@ -1,6 +1,6 @@
 [package]
 name = "seekable-async-file"
-description = "Async file reads and writes at offsets, with optional delayed sync"
+description = "Async pread and pwrite for Rust, with optional delayed sync and metrics "
 license = "Apache-2.0"
 homepage = "https://github.com/wilsonzlin/seekable-async-file"
 readme = "README.md"
