@@ -1,0 +1,28 @@
+[package]
+name = "seekable-async-file"
+description = "Async file reads and writes at offsets, with optional delayed sync"
+license = "Apache-2.0"
+homepage = "https://github.com/wilsonzlin/seekable-async-file"
+readme = "README.md"
+keywords = ["async", "delayed", "file", "pread", "pwrite"]
+repository = "https://github.com/wilsonzlin/seekable-async-file.git"
+version = "0.0.1"
+authors = ["Wilson Lin <code@wilsonl.in>"]
+edition = "2021"
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[features]
+default = ["fsync_delayed", "mmap"]
+fsync_delayed = []
+fsync_immediate = []
+mmap = ["dep:memmap2"]
+tokio_file = []
+unsafe_fsync_none = [] # For benchmarking purposes only!
+
+[dependencies]
+libc = "0.2"
+memmap2 = { version = "0.5", optional = true }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
