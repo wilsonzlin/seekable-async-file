@@ -22,7 +22,7 @@ If this is used, make sure to also execute the `start_delayed_data_sync_backgrou
 
 ## Metrics
 
-Metrics will be populated via the `SeekableAsyncFileMetrics` struct. All values are atomic, so it's possible to read them at any time from any thread safely using the `Relaxed` ordering. This is designed for use inside a larger system (e.g. database, object storage, cache) or I/O subsystem.
+Metrics will be populated via the `SeekableAsyncFileMetrics` struct. All values are atomic, so it's possible to read them at any time from any thread safely using the provided getter methods. This is designed for use inside a larger system (e.g. database, object storage, cache) or I/O subsystem.
 
 ## Features
 

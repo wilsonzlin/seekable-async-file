@@ -38,16 +38,41 @@ struct PendingSyncState {
   pending_sync_fut_states: Vec<Arc<std::sync::Mutex<PendingSyncFutureState>>>,
 }
 
+/// Metrics populated by a `SeekableAsyncFile`. There should be exactly one per `SeekableAsyncFile`; don't share between multiple `SeekableAsyncFile` values.
+///
+/// To initalise, use `SeekableAsyncFileMetrics::default()`. The values can be accessed via the thread-safe getter methods.
+#[derive(Default, Debug)]
 pub struct SeekableAsyncFileMetrics {
-  pub sync_background_loops_counter: AtomicU64,
-  pub sync_counter: AtomicU64,
-  pub sync_delayed_counter: AtomicU64,
-  pub sync_longest_delay_us_counter: AtomicU64,
-  pub sync_shortest_delay_us_counter: AtomicU64,
-  pub sync_us_counter: AtomicU64,
-  pub write_bytes_counter: AtomicU64,
-  pub write_counter: AtomicU64,
-  pub write_us_counter: AtomicU64,
+  sync_background_loops_counter: AtomicU64,
+  sync_counter: AtomicU64,
+  sync_delayed_counter: AtomicU64,
+  sync_longest_delay_us_counter: AtomicU64,
+  sync_shortest_delay_us_counter: AtomicU64,
+  sync_us_counter: AtomicU64,
+  write_bytes_counter: AtomicU64,
+  write_counter: AtomicU64,
+  write_us_counter: AtomicU64,
+}
+
+impl SeekableAsyncFileMetrics {
+  /// Total number of delayed sync background loop iterations.
+  pub fn sync_background_loops_counter(&self) -> u64 { self.sync_background_loops_counter.load(Ordering::Relaxed) }
+  /// Total number of fsync and fdatasync syscalls.
+  pub fn sync_counter(&self) -> u64 { self.sync_counter.load(Ordering::Relaxed) }
+  /// Total number of requested syncs that were delayed until a later time.
+  pub fn sync_delayed_counter(&self) -> u64 { self.sync_delayed_counter.load(Ordering::Relaxed) }
+  /// Total number of microseconds spent waiting for a sync by one or more delayed syncs.
+  pub fn sync_longest_delay_us_counter(&self) -> u64 { self.sync_longest_delay_us_counter.load(Ordering::Relaxed) }
+  /// Total number of microseconds spent waiting after a final delayed sync before the actual sync.
+  pub fn sync_shortest_delay_us_counter(&self) -> u64 { self.sync_shortest_delay_us_counter.load(Ordering::Relaxed) }
+  /// Total number of microseconds spent in fsync and fdatasync syscalls.
+  pub fn sync_us_counter(&self) -> u64 { self.sync_us_counter.load(Ordering::Relaxed) }
+  /// Total number of bytes written.
+  pub fn write_bytes_counter(&self) -> u64 { self.write_bytes_counter.load(Ordering::Relaxed) }
+  /// Total number of write syscalls.
+  pub fn write_counter(&self) -> u64 { self.write_counter.load(Ordering::Relaxed) }
+  /// Total number of microseconds spent in write syscalls.
+  pub fn write_us_counter(&self) -> u64 { self.write_us_counter.load(Ordering::Relaxed) }
 }
 
 // Tokio has still not implemented read_at and write_at: https://github.com/tokio-rs/tokio/issues/1529. We need these to be able to share a file descriptor across threads (e.g. use from within async function).
@@ -90,6 +115,13 @@ impl Future for PendingSyncFuture {
 }
 
 impl SeekableAsyncFile {
+  /// Open a file descriptor in read and write modes, creating it if it doesn't exist. If it already exists, the contents won't be truncated.
+  ///
+  /// To save a `stat` call, the size must be provided. This also allows opening non-standard files which may have a size of zero (e.g. block devices). If the mmap feature is being used, a different size value also allows only using a portion of the beginning of the file.
+  ///
+  /// The `io_direct` and `io_dsync` parameters set the `O_DIRECT` and `O_DSYNC` flags, respectively. Unless you need those flags, provide `false`.
+  ///
+  /// Make sure to execute `start_delayed_data_sync_background_loop` in the background after this call.
   pub async fn open(
     path: &Path,
     size: u64,
