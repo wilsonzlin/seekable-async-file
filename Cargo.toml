@@ -14,12 +14,9 @@ edition = "2021"
 maintenance = { status = "actively-developed" }
 
 [features]
-default = ["fsync_delayed", "mmap"]
-fsync_delayed = []
-fsync_immediate = []
+default = ["mmap"]
 mmap = ["dep:memmap2"]
 tokio_file = []
-unsafe_fsync_none = [] # For benchmarking purposes only!
 
 [dependencies]
 futures = "0.3"

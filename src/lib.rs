@@ -14,7 +14,6 @@ use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
 use tokio::fs::OpenOptions;
-use tokio::spawn;
 use tokio::sync::Mutex;
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
@@ -35,20 +34,41 @@ fn dur_us(dur: Instant) -> u64 {
 
 /// Data to write and the offset to write it at. This is provided to `write_at_with_delayed_sync`.
 pub struct WriteRequest {
-  pub data: Vec<u8>,
-  pub offset: u64,
+  data: Vec<u8>,
+  offset: u64,
+  deduplicate_seq: Option<u64>,
 }
 
-pub struct DeduplicatedWriteRequest {
-  pub data: Vec<u8>,
-  pub offset: u64,
-  pub seq: u64,
+impl WriteRequest {
+  pub fn new(offset: u64, data: Vec<u8>) -> Self {
+    Self {
+      data,
+      offset,
+      deduplicate_seq: None,
+    }
+  }
+
+  // POSIX write(2) calls can be reordered between fdatasync/fsync calls, so sequential writes to the same offset may not result in the last being the winner. Normally, writes to the same offset don't occur before a sync as that would be clobbering an unconfirmed change, but sometimes this is needed. Provide this variant to `write_at_with_delayed_sync` (not `write_at`), the write will be recorded (but delayed) and then applied on the next scheduled fdatasync, and the write with the highest `seq` to an offset will always win. In addition, sometimes use of async will also make it difficult to ensure ordering; therefore, a `seq` should also be provided so that any call with a less `seq` than the highest seen `seq` of all previous calls are ignored. If this is unnecessary/unwanted, always provide the same `seq` value (e.g. 0).
+  pub fn deduplicated(offset: u64, seq: u64, data: Vec<u8>) -> Self {
+    Self {
+      data,
+      offset,
+      deduplicate_seq: Some(seq),
+    }
+  }
+}
+
+#[derive(Default)]
+struct PendingDeduplicatedWrites {
+  data: HashMap<u64, Vec<u8>>,
+  seen_seq: HashMap<u64, u64>,
 }
 
 struct PendingSyncState {
   earliest_unsynced: Option<Instant>, // Only set when first pending_sync_fut_states is created; otherwise, metrics are misleading as we'd count time when no one is waiting for a sync as delayed sync time.
   latest_unsynced: Option<Instant>,
   pending_sync_fut_states: Vec<Arc<std::sync::Mutex<PendingSyncFutureState>>>,
+  pending_deduplicated_writes: PendingDeduplicatedWrites,
 }
 
 /// Metrics populated by a `SeekableAsyncFile`. There should be exactly one per `SeekableAsyncFile`; don't share between multiple `SeekableAsyncFile` values.
@@ -114,12 +134,6 @@ impl SeekableAsyncFileMetrics {
   }
 }
 
-#[derive(Default)]
-struct PendingDeduplicatedWrites {
-  data: HashMap<u64, Vec<u8>>,
-  seen_seq: HashMap<u64, u64>,
-}
-
 /// A `File`-like value that can perform async `read_at` and `write_at` for I/O at specific offsets without mutating any state (i.e. is thread safe). Metrics are collected, and syncs can be delayed for write batching opportunities as a performance optimisation.
 #[derive(Clone)]
 pub struct SeekableAsyncFile {
@@ -131,11 +145,9 @@ pub struct SeekableAsyncFile {
   mmap: Arc<memmap2::MmapRaw>,
   #[cfg(feature = "mmap")]
   mmap_len: usize,
-  #[cfg(feature = "fsync_delayed")]
   sync_delay_us: u64,
   metrics: Arc<SeekableAsyncFileMetrics>,
   pending_sync_state: Arc<Mutex<PendingSyncState>>,
-  pending_deduplicated_writes: Arc<Mutex<PendingDeduplicatedWrites>>,
 }
 
 struct PendingSyncFutureState {
@@ -173,7 +185,7 @@ impl SeekableAsyncFile {
     path: &Path,
     #[cfg(feature = "mmap")] size: u64,
     metrics: Arc<SeekableAsyncFileMetrics>,
-    #[cfg(feature = "fsync_delayed")] sync_delay: Duration,
+    sync_delay: Duration,
     io_direct: bool,
     io_dsync: bool,
   ) -> Self {
@@ -202,15 +214,14 @@ impl SeekableAsyncFile {
       mmap: Arc::new(memmap2::MmapRaw::map_raw(&fd).unwrap()),
       #[cfg(feature = "mmap")]
       mmap_len: as_usize!(size),
-      #[cfg(feature = "fsync_delayed")]
       sync_delay_us: sync_delay.as_micros().try_into().unwrap(),
       metrics,
       pending_sync_state: Arc::new(Mutex::new(PendingSyncState {
         earliest_unsynced: None,
         latest_unsynced: None,
         pending_sync_fut_states: Vec::new(),
+        pending_deduplicated_writes: PendingDeduplicatedWrites::default(),
       })),
-      pending_deduplicated_writes: Arc::new(Mutex::new(PendingDeduplicatedWrites::default())),
     }
   }
 
@@ -243,17 +254,6 @@ impl SeekableAsyncFile {
   pub async fn read_u64_at(&self, offset: u64) -> u64 {
     let bytes = self.read_at(offset, 8).await;
     u64::from_be_bytes(bytes.try_into().unwrap())
-  }
-
-  // POSIX write(2) calls can be reordered between fdatasync/fsync calls, so sequential writes to the same offset may not result in the last being the winner. Normally, writes to the same offset don't occur before a sync as that would be clobbering an unconfirmed change, but sometimes this is needed. This function will record (but delay) the write and then apply it on the next fdatasync, and the latest write to an offset will always win. In addition, sometimes use of async will also make it difficult to ensure ordering; therefore, a `seq` should also be provided so that any call with a less `seq` than the highest seen `seq` of all previous calls are ignored. If this is unnecessary/unwanted, always provide the same `seq` value (e.g. 0).
-  pub async fn add_pending_deduplicated_write(&self, reqs: Vec<DeduplicatedWriteRequest>) {
-    let mut writes = self.pending_deduplicated_writes.lock().await;
-    for DeduplicatedWriteRequest { data, offset, seq } in reqs {
-      if writes.seen_seq.get(&offset).filter(|s| **s > seq).is_none() {
-        writes.data.insert(offset, data);
-        writes.seen_seq.insert(offset, seq);
-      };
-    }
   }
 
   fn bump_write_metrics(&self, len: u64, call_us: u64) {
@@ -297,43 +297,60 @@ impl SeekableAsyncFile {
 
   pub async fn write_at_with_delayed_sync(&self, writes: Vec<WriteRequest>) {
     let count: u64 = writes.len().try_into().unwrap();
+    let mut deduplicated = vec![];
     for w in writes {
-      self.write_at(w.offset, w.data).await;
+      match w.deduplicate_seq {
+        Some(_) => deduplicated.push(w),
+        None => self.write_at(w.offset, w.data).await,
+      };
     }
 
-    #[cfg(feature = "fsync_immediate")]
-    self.sync_data().await;
+    let fut_state = Arc::new(std::sync::Mutex::new(PendingSyncFutureState {
+      completed: false,
+      waker: None,
+    }));
 
-    #[cfg(feature = "fsync_delayed")]
     {
-      let fut_state = Arc::new(std::sync::Mutex::new(PendingSyncFutureState {
-        completed: false,
-        waker: None,
-      }));
+      let mut state = self.pending_sync_state.lock().await;
+      let now = Instant::now();
+      state.earliest_unsynced.get_or_insert(now);
+      state.latest_unsynced = Some(now);
+      state.pending_sync_fut_states.push(fut_state.clone());
 
-      {
-        let mut state = self.pending_sync_state.lock().await;
-        let now = Instant::now();
-        state.earliest_unsynced.get_or_insert(now);
-        state.latest_unsynced = Some(now);
-        state.pending_sync_fut_states.push(fut_state.clone());
-      };
-
-      self
-        .metrics
-        .sync_delayed_counter
-        .fetch_add(count, Ordering::Relaxed);
-
-      PendingSyncFuture {
-        shared_state: fut_state,
+      for w in deduplicated {
+        if state
+          .pending_deduplicated_writes
+          .seen_seq
+          .get(&w.offset)
+          .filter(|s| **s > w.deduplicate_seq.unwrap())
+          .is_none()
+        {
+          state
+            .pending_deduplicated_writes
+            .data
+            .insert(w.offset, w.data);
+          state
+            .pending_deduplicated_writes
+            .seen_seq
+            .insert(w.offset, w.deduplicate_seq.unwrap());
+        };
       }
-      .await;
     };
+
+    self
+      .metrics
+      .sync_delayed_counter
+      .fetch_add(count, Ordering::Relaxed);
+
+    PendingSyncFuture {
+      shared_state: fut_state,
+    }
+    .await;
   }
 
-  #[cfg(feature = "fsync_delayed")]
   pub async fn start_delayed_data_sync_background_loop(&self) {
     let mut futures_to_wake = Vec::new();
+    let mut deduplicated_writes = Vec::new();
     loop {
       sleep(std::time::Duration::from_micros(self.sync_delay_us)).await;
 
@@ -345,7 +362,9 @@ impl SeekableAsyncFile {
       let sync_now = {
         let mut state = self.pending_sync_state.lock().await;
 
-        if !state.pending_sync_fut_states.is_empty() {
+        if !state.pending_sync_fut_states.is_empty()
+          || !state.pending_deduplicated_writes.data.is_empty()
+        {
           let longest_delay_us = dur_us(state.earliest_unsynced.unwrap());
           let shortest_delay_us = dur_us(state.latest_unsynced.unwrap());
 
@@ -353,6 +372,7 @@ impl SeekableAsyncFile {
           state.latest_unsynced = None;
 
           futures_to_wake.extend(state.pending_sync_fut_states.drain(..));
+          deduplicated_writes.extend(state.pending_deduplicated_writes.data.drain());
 
           Some(SyncNow {
             longest_delay_us,
@@ -378,9 +398,13 @@ impl SeekableAsyncFile {
           .sync_shortest_delay_us_counter
           .fetch_add(shortest_delay_us, Ordering::Relaxed);
 
-        assert!(!futures_to_wake.is_empty());
-        let file = self.clone();
-        spawn(async move { file.sync_data().await }).await.unwrap();
+        iter(deduplicated_writes.drain(..))
+          .for_each_concurrent(None, |(offset, data)| async move {
+            self.write_at(offset, data).await;
+          })
+          .await;
+
+        self.sync_data().await;
 
         for ft in futures_to_wake.drain(..) {
           let mut ft = ft.lock().unwrap();
@@ -399,12 +423,6 @@ impl SeekableAsyncFile {
   }
 
   pub async fn sync_data(&self) {
-    iter(self.pending_deduplicated_writes.lock().await.data.drain())
-      .for_each_concurrent(None, |(offset, data)| async move {
-        self.write_at(offset, data).await;
-      })
-      .await;
-
     #[cfg(feature = "tokio_file")]
     let fd = self.fd.clone();
     #[cfg(feature = "mmap")]
