@@ -1,9 +1,14 @@
+use futures::stream::iter;
+use futures::StreamExt;
+use std::collections::HashMap;
 use std::future::Future;
+#[cfg(feature = "tokio_file")]
+use std::os::unix::prelude::FileExt;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
@@ -12,13 +17,8 @@ use tokio::fs::OpenOptions;
 use tokio::spawn;
 use tokio::sync::Mutex;
 use tokio::task::spawn_blocking;
-use tokio::time::Instant;
 use tokio::time::sleep;
-
-#[cfg(feature = "tokio_file")]
-use {
-  std::os::unix::prelude::FileExt
-};
+use tokio::time::Instant;
 
 // Use this over `as usize` for safety without verbosity of `.try_into::<usize>().unwrap()`.
 #[allow(unused_macros)]
@@ -63,25 +63,50 @@ pub struct SeekableAsyncFileMetrics {
 
 impl SeekableAsyncFileMetrics {
   /// Total number of delayed sync background loop iterations.
-  pub fn sync_background_loops_counter(&self) -> u64 { self.sync_background_loops_counter.load(Ordering::Relaxed) }
-  /// Total number of fsync and fdatasync syscalls.
-  pub fn sync_counter(&self) -> u64 { self.sync_counter.load(Ordering::Relaxed) }
-  /// Total number of requested syncs that were delayed until a later time.
-  pub fn sync_delayed_counter(&self) -> u64 { self.sync_delayed_counter.load(Ordering::Relaxed) }
-  /// Total number of microseconds spent waiting for a sync by one or more delayed syncs.
-  pub fn sync_longest_delay_us_counter(&self) -> u64 { self.sync_longest_delay_us_counter.load(Ordering::Relaxed) }
-  /// Total number of microseconds spent waiting after a final delayed sync before the actual sync.
-  pub fn sync_shortest_delay_us_counter(&self) -> u64 { self.sync_shortest_delay_us_counter.load(Ordering::Relaxed) }
-  /// Total number of microseconds spent in fsync and fdatasync syscalls.
-  pub fn sync_us_counter(&self) -> u64 { self.sync_us_counter.load(Ordering::Relaxed) }
-  /// Total number of bytes written.
-  pub fn write_bytes_counter(&self) -> u64 { self.write_bytes_counter.load(Ordering::Relaxed) }
-  /// Total number of write syscalls.
-  pub fn write_counter(&self) -> u64 { self.write_counter.load(Ordering::Relaxed) }
-  /// Total number of microseconds spent in write syscalls.
-  pub fn write_us_counter(&self) -> u64 { self.write_us_counter.load(Ordering::Relaxed) }
-}
+  pub fn sync_background_loops_counter(&self) -> u64 {
+    self.sync_background_loops_counter.load(Ordering::Relaxed)
+  }
 
+  /// Total number of fsync and fdatasync syscalls.
+  pub fn sync_counter(&self) -> u64 {
+    self.sync_counter.load(Ordering::Relaxed)
+  }
+
+  /// Total number of requested syncs that were delayed until a later time.
+  pub fn sync_delayed_counter(&self) -> u64 {
+    self.sync_delayed_counter.load(Ordering::Relaxed)
+  }
+
+  /// Total number of microseconds spent waiting for a sync by one or more delayed syncs.
+  pub fn sync_longest_delay_us_counter(&self) -> u64 {
+    self.sync_longest_delay_us_counter.load(Ordering::Relaxed)
+  }
+
+  /// Total number of microseconds spent waiting after a final delayed sync before the actual sync.
+  pub fn sync_shortest_delay_us_counter(&self) -> u64 {
+    self.sync_shortest_delay_us_counter.load(Ordering::Relaxed)
+  }
+
+  /// Total number of microseconds spent in fsync and fdatasync syscalls.
+  pub fn sync_us_counter(&self) -> u64 {
+    self.sync_us_counter.load(Ordering::Relaxed)
+  }
+
+  /// Total number of bytes written.
+  pub fn write_bytes_counter(&self) -> u64 {
+    self.write_bytes_counter.load(Ordering::Relaxed)
+  }
+
+  /// Total number of write syscalls.
+  pub fn write_counter(&self) -> u64 {
+    self.write_counter.load(Ordering::Relaxed)
+  }
+
+  /// Total number of microseconds spent in write syscalls.
+  pub fn write_us_counter(&self) -> u64 {
+    self.write_us_counter.load(Ordering::Relaxed)
+  }
+}
 
 /// A `File`-like value that can perform async `read_at` and `write_at` for I/O at specific offsets without mutating any state (i.e. is thread safe). Metrics are collected, and syncs can be delayed for write batching opportunities as a performance optimisation.
 #[derive(Clone)]
@@ -98,6 +123,7 @@ pub struct SeekableAsyncFile {
   sync_delay_us: u64,
   metrics: Arc<SeekableAsyncFileMetrics>,
   pending_sync_state: Arc<Mutex<PendingSyncState>>,
+  pending_deduplicated_writes: Arc<Mutex<HashMap<u64, Vec<u8>>>>,
 }
 
 struct PendingSyncFutureState {
@@ -133,11 +159,9 @@ impl SeekableAsyncFile {
   /// Make sure to execute `start_delayed_data_sync_background_loop` in the background after this call.
   pub async fn open(
     path: &Path,
-    #[cfg(feature = "mmap")]
-    size: u64,
+    #[cfg(feature = "mmap")] size: u64,
     metrics: Arc<SeekableAsyncFileMetrics>,
-    #[cfg(feature = "fsync_delayed")]
-    sync_delay: Duration,
+    #[cfg(feature = "fsync_delayed")] sync_delay: Duration,
     io_direct: bool,
     io_dsync: bool,
   ) -> Self {
@@ -174,6 +198,7 @@ impl SeekableAsyncFile {
         latest_unsynced: None,
         pending_sync_fut_states: Vec::new(),
       })),
+      pending_deduplicated_writes: Arc::new(Mutex::new(HashMap::new())),
     }
   }
 
@@ -208,6 +233,27 @@ impl SeekableAsyncFile {
     u64::from_be_bytes(bytes.try_into().unwrap())
   }
 
+  // POSIX write(2) calls can be reordered between fdatasync/fsync calls, so sequential writes to the same range may not result in the last being the winner. Normally, writes to the same offset don't occur before a sync as that would be clobbering an unconfirmed change, but sometimes this is needed. This function will add the write to a list that will be applied on the next fdatasync, and the latest write to an offset will always win.
+  pub async fn add_pending_deduplicated_write(&self, offset: u64, data: Vec<u8>) {
+    self
+      .pending_deduplicated_writes
+      .lock()
+      .await
+      .insert(offset, data);
+  }
+
+  fn bump_write_metrics(&self, len: u64, call_us: u64) {
+    self
+      .metrics
+      .write_bytes_counter
+      .fetch_add(len, Ordering::Relaxed);
+    self.metrics.write_counter.fetch_add(1, Ordering::Relaxed);
+    self
+      .metrics
+      .write_us_counter
+      .fetch_add(call_us, Ordering::Relaxed);
+  }
+
   #[cfg(feature = "tokio_file")]
   pub async fn write_at(&self, offset: u64, data: Vec<u8>) {
     let fd = self.fd.clone();
@@ -218,18 +264,7 @@ impl SeekableAsyncFile {
       .unwrap();
     // Yes, we're including the overhead of Tokio's spawn_blocking.
     let call_us: u64 = started.elapsed().as_micros().try_into().unwrap();
-    self
-      .metrics
-      .write_bytes_counter
-      .fetch_add(len, Ordering::Relaxed);
-    self
-      .metrics
-      .write_counter
-      .fetch_add(1, Ordering::Relaxed);
-    self
-      .metrics
-      .write_us_counter
-      .fetch_add(call_us, Ordering::Relaxed);
+    self.bump_write_metrics(len, call_us);
   }
 
   #[cfg(feature = "mmap")]
@@ -237,8 +272,13 @@ impl SeekableAsyncFile {
     let offset = as_usize!(offset);
     let len = data.len();
 
+    let started = Instant::now();
     let memory = unsafe { std::slice::from_raw_parts_mut(self.mmap.as_mut_ptr(), self.mmap_len) };
     memory[offset..offset + len].copy_from_slice(&data);
+    // This could be significant e.g. page fault.
+    let call_us: u64 = started.elapsed().as_micros().try_into().unwrap();
+
+    self.bump_write_metrics(len.try_into().unwrap(), call_us);
   }
 
   pub async fn write_at_with_delayed_sync(&self, writes: Vec<WriteRequest>) {
@@ -345,6 +385,12 @@ impl SeekableAsyncFile {
   }
 
   pub async fn sync_data(&self) {
+    iter(self.pending_deduplicated_writes.lock().await.drain())
+      .for_each_concurrent(None, |(offset, data)| async move {
+        self.write_at(offset, data).await;
+      })
+      .await;
+
     #[cfg(feature = "tokio_file")]
     let fd = self.fd.clone();
     #[cfg(feature = "mmap")]
