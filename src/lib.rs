@@ -39,6 +39,12 @@ pub struct WriteRequest {
   pub offset: u64,
 }
 
+pub struct DeduplicatedWriteRequest {
+  pub data: Vec<u8>,
+  pub offset: u64,
+  pub seq: u64,
+}
+
 struct PendingSyncState {
   earliest_unsynced: Option<Instant>, // Only set when first pending_sync_fut_states is created; otherwise, metrics are misleading as we'd count time when no one is waiting for a sync as delayed sync time.
   latest_unsynced: Option<Instant>,
@@ -108,6 +114,12 @@ impl SeekableAsyncFileMetrics {
   }
 }
 
+#[derive(Default)]
+struct PendingDeduplicatedWrites {
+  data: HashMap<u64, Vec<u8>>,
+  seen_seq: HashMap<u64, u64>,
+}
+
 /// A `File`-like value that can perform async `read_at` and `write_at` for I/O at specific offsets without mutating any state (i.e. is thread safe). Metrics are collected, and syncs can be delayed for write batching opportunities as a performance optimisation.
 #[derive(Clone)]
 pub struct SeekableAsyncFile {
@@ -123,7 +135,7 @@ pub struct SeekableAsyncFile {
   sync_delay_us: u64,
   metrics: Arc<SeekableAsyncFileMetrics>,
   pending_sync_state: Arc<Mutex<PendingSyncState>>,
-  pending_deduplicated_writes: Arc<Mutex<HashMap<u64, Vec<u8>>>>,
+  pending_deduplicated_writes: Arc<Mutex<PendingDeduplicatedWrites>>,
 }
 
 struct PendingSyncFutureState {
@@ -198,7 +210,7 @@ impl SeekableAsyncFile {
         latest_unsynced: None,
         pending_sync_fut_states: Vec::new(),
       })),
-      pending_deduplicated_writes: Arc::new(Mutex::new(HashMap::new())),
+      pending_deduplicated_writes: Arc::new(Mutex::new(PendingDeduplicatedWrites::default())),
     }
   }
 
@@ -233,13 +245,15 @@ impl SeekableAsyncFile {
     u64::from_be_bytes(bytes.try_into().unwrap())
   }
 
-  // POSIX write(2) calls can be reordered between fdatasync/fsync calls, so sequential writes to the same range may not result in the last being the winner. Normally, writes to the same offset don't occur before a sync as that would be clobbering an unconfirmed change, but sometimes this is needed. This function will add the write to a list that will be applied on the next fdatasync, and the latest write to an offset will always win.
-  pub async fn add_pending_deduplicated_write(&self, offset: u64, data: Vec<u8>) {
-    self
-      .pending_deduplicated_writes
-      .lock()
-      .await
-      .insert(offset, data);
+  // POSIX write(2) calls can be reordered between fdatasync/fsync calls, so sequential writes to the same offset may not result in the last being the winner. Normally, writes to the same offset don't occur before a sync as that would be clobbering an unconfirmed change, but sometimes this is needed. This function will record (but delay) the write and then apply it on the next fdatasync, and the latest write to an offset will always win. In addition, sometimes use of async will also make it difficult to ensure ordering; therefore, a `seq` should also be provided so that any call with a less `seq` than the highest seen `seq` of all previous calls are ignored. If this is unnecessary/unwanted, always provide the same `seq` value (e.g. 0).
+  pub async fn add_pending_deduplicated_write(&self, reqs: Vec<DeduplicatedWriteRequest>) {
+    let mut writes = self.pending_deduplicated_writes.lock().await;
+    for DeduplicatedWriteRequest { data, offset, seq } in reqs {
+      if writes.seen_seq.get(&offset).filter(|s| **s > seq).is_none() {
+        writes.data.insert(offset, data);
+        writes.seen_seq.insert(offset, seq);
+      };
+    }
   }
 
   fn bump_write_metrics(&self, len: u64, call_us: u64) {
@@ -385,7 +399,7 @@ impl SeekableAsyncFile {
   }
 
   pub async fn sync_data(&self) {
-    iter(self.pending_deduplicated_writes.lock().await.drain())
+    iter(self.pending_deduplicated_writes.lock().await.data.drain())
       .for_each_concurrent(None, |(offset, data)| async move {
         self.write_at(offset, data).await;
       })
