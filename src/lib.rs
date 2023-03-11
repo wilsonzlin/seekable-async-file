@@ -1,17 +1,14 @@
 use futures::stream::iter;
 use futures::StreamExt;
+use signal_future::SignalFuture;
+use signal_future::SignalFutureController;
 use std::collections::HashMap;
-use std::future::Future;
 #[cfg(feature = "tokio_file")]
 use std::os::unix::prelude::FileExt;
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::task::Context;
-use std::task::Poll;
-use std::task::Waker;
 use std::time::Duration;
 use tokio::fs::OpenOptions;
 use tokio::sync::Mutex;
@@ -67,7 +64,7 @@ struct PendingDeduplicatedWrites {
 struct PendingSyncState {
   earliest_unsynced: Option<Instant>, // Only set when first pending_sync_fut_states is created; otherwise, metrics are misleading as we'd count time when no one is waiting for a sync as delayed sync time.
   latest_unsynced: Option<Instant>,
-  pending_sync_fut_states: Vec<Arc<std::sync::Mutex<PendingSyncFutureState>>>,
+  pending_sync_fut_states: Vec<SignalFutureController>,
   pending_deduplicated_writes: PendingDeduplicatedWrites,
 }
 
@@ -148,29 +145,6 @@ pub struct SeekableAsyncFile {
   sync_delay_us: u64,
   metrics: Arc<SeekableAsyncFileMetrics>,
   pending_sync_state: Arc<Mutex<PendingSyncState>>,
-}
-
-struct PendingSyncFutureState {
-  completed: bool,
-  waker: Option<Waker>,
-}
-
-struct PendingSyncFuture {
-  shared_state: Arc<std::sync::Mutex<PendingSyncFutureState>>,
-}
-
-impl Future for PendingSyncFuture {
-  type Output = ();
-
-  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    let mut shared_state = self.shared_state.lock().unwrap();
-    if shared_state.completed {
-      Poll::Ready(())
-    } else {
-      shared_state.waker = Some(cx.waker().clone());
-      Poll::Pending
-    }
-  }
 }
 
 impl SeekableAsyncFile {
@@ -305,17 +279,14 @@ impl SeekableAsyncFile {
       };
     }
 
-    let fut_state = Arc::new(std::sync::Mutex::new(PendingSyncFutureState {
-      completed: false,
-      waker: None,
-    }));
+    let (fut, fut_ctl) = SignalFuture::new();
 
     {
       let mut state = self.pending_sync_state.lock().await;
       let now = Instant::now();
       state.earliest_unsynced.get_or_insert(now);
       state.latest_unsynced = Some(now);
-      state.pending_sync_fut_states.push(fut_state.clone());
+      state.pending_sync_fut_states.push(fut_ctl.clone());
 
       for w in deduplicated {
         if state
@@ -342,13 +313,11 @@ impl SeekableAsyncFile {
       .sync_delayed_counter
       .fetch_add(count, Ordering::Relaxed);
 
-    PendingSyncFuture {
-      shared_state: fut_state,
-    }
-    .await;
+    fut.await;
   }
 
   pub async fn start_delayed_data_sync_background_loop(&self) {
+    // Store these outside and reuse them to avoid reallocations on each loop.
     let mut futures_to_wake = Vec::new();
     let mut deduplicated_writes = Vec::new();
     loop {
@@ -407,11 +376,7 @@ impl SeekableAsyncFile {
         self.sync_data().await;
 
         for ft in futures_to_wake.drain(..) {
-          let mut ft = ft.lock().unwrap();
-          ft.completed = true;
-          if let Some(waker) = ft.waker.take() {
-            waker.wake();
-          };
+          ft.signal();
         }
       };
 
