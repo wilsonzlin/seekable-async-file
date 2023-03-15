@@ -1,5 +1,6 @@
 use futures::stream::iter;
 use futures::StreamExt;
+use off64::usz;
 use signal_future::SignalFuture;
 use signal_future::SignalFutureController;
 use std::collections::HashMap;
@@ -15,15 +16,6 @@ use tokio::sync::Mutex;
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tokio::time::Instant;
-
-// Use this over `as usize` for safety without verbosity of `.try_into::<usize>().unwrap()`.
-#[allow(unused_macros)]
-macro_rules! as_usize {
-  ($v:expr) => {{
-    let v: usize = $v.try_into().unwrap();
-    v
-  }};
-}
 
 fn dur_us(dur: Instant) -> u64 {
   dur.elapsed().as_micros().try_into().unwrap()
@@ -160,17 +152,8 @@ impl SeekableAsyncFile {
     #[cfg(feature = "mmap")] size: u64,
     metrics: Arc<SeekableAsyncFileMetrics>,
     sync_delay: Duration,
-    io_direct: bool,
-    io_dsync: bool,
+    flags: i32,
   ) -> Self {
-    let mut flags = 0;
-    if io_direct {
-      flags |= libc::O_DIRECT;
-    };
-    if io_dsync {
-      flags |= libc::O_DSYNC;
-    };
-
     let async_fd = OpenOptions::new()
       .read(true)
       .write(true)
@@ -187,7 +170,7 @@ impl SeekableAsyncFile {
       #[cfg(feature = "mmap")]
       mmap: Arc::new(memmap2::MmapRaw::map_raw(&fd).unwrap()),
       #[cfg(feature = "mmap")]
-      mmap_len: as_usize!(size),
+      mmap_len: usz!(size),
       sync_delay_us: sync_delay.as_micros().try_into().unwrap(),
       metrics,
       pending_sync_state: Arc::new(Mutex::new(PendingSyncState {
@@ -214,8 +197,8 @@ impl SeekableAsyncFile {
 
   #[cfg(feature = "mmap")]
   pub async fn read_at(&self, offset: u64, len: u64) -> Vec<u8> {
-    let offset = as_usize!(offset);
-    let len = as_usize!(len);
+    let offset = usz!(offset);
+    let len = usz!(len);
     let memory = unsafe { std::slice::from_raw_parts(self.mmap.as_ptr(), self.mmap_len) };
     memory[offset..offset + len].to_vec()
   }
@@ -257,7 +240,7 @@ impl SeekableAsyncFile {
 
   #[cfg(feature = "mmap")]
   pub async fn write_at(&self, offset: u64, data: Vec<u8>) {
-    let offset = as_usize!(offset);
+    let offset = usz!(offset);
     let len = data.len();
 
     let started = Instant::now();

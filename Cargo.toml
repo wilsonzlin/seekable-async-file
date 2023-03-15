@@ -20,8 +20,7 @@ tokio_file = []
 
 [dependencies]
 futures = "0.3"
-signal-future = "0.0.1"
-libc = "0.2"
 memmap2 = { version = "0.5", optional = true }
-tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
+off64 = "0.0.2"
+signal-future = "0.0.1"
+tokio = { version = "1", features = ["fs", "rt", "sync", "time"] }
