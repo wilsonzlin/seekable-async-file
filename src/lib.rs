@@ -199,18 +199,22 @@ impl SeekableAsyncFile {
   pub async fn read_at(&self, offset: u64, len: u64) -> Vec<u8> {
     let offset = usz!(offset);
     let len = usz!(len);
+    let mmap = self.mmap.clone();
+    let mmap_len = self.mmap_len;
+    spawn_blocking(move || {
+      let memory = unsafe { std::slice::from_raw_parts(mmap.as_ptr(), mmap_len) };
+      memory[offset..offset + len].to_vec()
+    })
+    .await
+    .unwrap()
+  }
+
+  #[cfg(feature = "mmap")]
+  pub fn read_at_sync(&self, offset: u64, len: u64) -> Vec<u8> {
+    let offset = usz!(offset);
+    let len = usz!(len);
     let memory = unsafe { std::slice::from_raw_parts(self.mmap.as_ptr(), self.mmap_len) };
     memory[offset..offset + len].to_vec()
-  }
-
-  pub async fn read_u16_at(&self, offset: u64) -> u16 {
-    let bytes = self.read_at(offset, 2).await;
-    u16::from_be_bytes(bytes.try_into().unwrap())
-  }
-
-  pub async fn read_u64_at(&self, offset: u64) -> u64 {
-    let bytes = self.read_at(offset, 8).await;
-    u64::from_be_bytes(bytes.try_into().unwrap())
   }
 
   fn bump_write_metrics(&self, len: u64, call_us: u64) {
@@ -242,13 +246,33 @@ impl SeekableAsyncFile {
   pub async fn write_at(&self, offset: u64, data: Vec<u8>) {
     let offset = usz!(offset);
     let len = data.len();
-
     let started = Instant::now();
-    let memory = unsafe { std::slice::from_raw_parts_mut(self.mmap.as_mut_ptr(), self.mmap_len) };
-    memory[offset..offset + len].copy_from_slice(&data);
+
+    let mmap = self.mmap.clone();
+    let mmap_len = self.mmap_len;
+    spawn_blocking(move || {
+      let memory = unsafe { std::slice::from_raw_parts_mut(mmap.as_mut_ptr(), mmap_len) };
+      memory[offset..offset + len].copy_from_slice(&data);
+    })
+    .await
+    .unwrap();
+
     // This could be significant e.g. page fault.
     let call_us: u64 = started.elapsed().as_micros().try_into().unwrap();
+    self.bump_write_metrics(len.try_into().unwrap(), call_us);
+  }
 
+  #[cfg(feature = "mmap")]
+  pub fn write_at_sync(&self, offset: u64, data: Vec<u8>) {
+    let offset = usz!(offset);
+    let len = data.len();
+    let started = Instant::now();
+
+    let memory = unsafe { std::slice::from_raw_parts_mut(self.mmap.as_mut_ptr(), self.mmap_len) };
+    memory[offset..offset + len].copy_from_slice(&data);
+
+    // This could be significant e.g. page fault.
+    let call_us: u64 = started.elapsed().as_micros().try_into().unwrap();
     self.bump_write_metrics(len.try_into().unwrap(), call_us);
   }
 
