@@ -196,6 +196,16 @@ impl SeekableAsyncFile {
   }
 
   #[cfg(feature = "mmap")]
+  pub unsafe fn get_mmap_raw_ptr(&self, offset: u64) -> *const u8 {
+    self.mmap.as_ptr().add(usz!(offset))
+  }
+
+  #[cfg(feature = "mmap")]
+  pub unsafe fn get_mmap_raw_mut_ptr(&self, offset: u64) -> *mut u8 {
+    self.mmap.as_mut_ptr().add(usz!(offset))
+  }
+
+  #[cfg(feature = "mmap")]
   pub async fn read_at(&self, offset: u64, len: u64) -> Vec<u8> {
     let offset = usz!(offset);
     let len = usz!(len);
@@ -282,6 +292,7 @@ impl SeekableAsyncFile {
     for w in writes {
       match w.deduplicate_seq {
         Some(_) => deduplicated.push(w),
+        // TODO Can we make this concurrent?
         None => self.write_at(w.offset, w.data).await,
       };
     }
