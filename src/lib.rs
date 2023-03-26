@@ -4,6 +4,7 @@ use off64::usz;
 use signal_future::SignalFuture;
 use signal_future::SignalFutureController;
 use std::collections::HashMap;
+use std::io::SeekFrom;
 #[cfg(feature = "tokio_file")]
 use std::os::unix::prelude::FileExt;
 use std::path::Path;
@@ -11,11 +12,20 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::fs::File;
 use tokio::fs::OpenOptions;
+use tokio::io;
+use tokio::io::AsyncSeekExt;
 use tokio::sync::Mutex;
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tokio::time::Instant;
+
+pub async fn get_file_len_via_seek(path: &Path) -> io::Result<u64> {
+  let mut file = File::open(path).await?;
+  // Note that `file.metadata().len()` is 0 for device files.
+  file.seek(SeekFrom::End(0)).await
+}
 
 fn dur_us(dur: Instant) -> u64 {
   dur.elapsed().as_micros().try_into().unwrap()
