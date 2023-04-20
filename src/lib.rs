@@ -1,8 +1,12 @@
 use async_trait::async_trait;
 use futures::stream::iter;
 use futures::StreamExt;
+use off64::chrono::Off64AsyncReadChrono;
+use off64::chrono::Off64AsyncWriteChrono;
 use off64::chrono::Off64ReadChrono;
 use off64::chrono::Off64WriteChrono;
+use off64::int::Off64AsyncReadInt;
+use off64::int::Off64AsyncWriteInt;
 use off64::int::Off64ReadInt;
 use off64::int::Off64WriteInt;
 use off64::usz;
@@ -477,6 +481,8 @@ impl<'a> Off64AsyncRead<'a, Vec<u8>> for SeekableAsyncFile {
     SeekableAsyncFile::read_at(self, offset, len).await
   }
 }
+impl<'a> Off64AsyncReadChrono<'a, Vec<u8>> for SeekableAsyncFile {}
+impl<'a> Off64AsyncReadInt<'a, Vec<u8>> for SeekableAsyncFile {}
 
 #[async_trait]
 impl Off64AsyncWrite for SeekableAsyncFile {
@@ -484,3 +490,5 @@ impl Off64AsyncWrite for SeekableAsyncFile {
     SeekableAsyncFile::write_at(self, offset, value.to_vec()).await
   }
 }
+impl Off64AsyncWriteChrono for SeekableAsyncFile {}
+impl Off64AsyncWriteInt for SeekableAsyncFile {}
