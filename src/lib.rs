@@ -1,6 +1,11 @@
+use async_trait::async_trait;
 use futures::stream::iter;
 use futures::StreamExt;
 use off64::usz;
+use off64::Off64AsyncRead;
+use off64::Off64AsyncWrite;
+use off64::Off64Read;
+use off64::Off64Write;
 use signal_future::SignalFuture;
 use signal_future::SignalFutureController;
 use std::collections::HashMap;
@@ -192,19 +197,6 @@ impl SeekableAsyncFile {
     }
   }
 
-  // Since spawn_blocking requires 'static lifetime, we don't have a read_into_at function taht takes a &mut [u8] buffer, as it would be more like a Arc<Mutex<Vec<u8>>>, at which point the overhead is not really worth it for small reads.
-  #[cfg(feature = "tokio_file")]
-  pub async fn read_at(&self, offset: u64, len: u64) -> Vec<u8> {
-    let fd = self.fd.clone();
-    spawn_blocking(move || {
-      let mut buf = vec![0u8; len.try_into().unwrap()];
-      fd.read_exact_at(&mut buf, offset).unwrap();
-      buf
-    })
-    .await
-    .unwrap()
-  }
-
   #[cfg(feature = "mmap")]
   pub unsafe fn get_mmap_raw_ptr(&self, offset: u64) -> *const u8 {
     self.mmap.as_ptr().add(usz!(offset))
@@ -213,28 +205,6 @@ impl SeekableAsyncFile {
   #[cfg(feature = "mmap")]
   pub unsafe fn get_mmap_raw_mut_ptr(&self, offset: u64) -> *mut u8 {
     self.mmap.as_mut_ptr().add(usz!(offset))
-  }
-
-  #[cfg(feature = "mmap")]
-  pub async fn read_at(&self, offset: u64, len: u64) -> Vec<u8> {
-    let offset = usz!(offset);
-    let len = usz!(len);
-    let mmap = self.mmap.clone();
-    let mmap_len = self.mmap_len;
-    spawn_blocking(move || {
-      let memory = unsafe { std::slice::from_raw_parts(mmap.as_ptr(), mmap_len) };
-      memory[offset..offset + len].to_vec()
-    })
-    .await
-    .unwrap()
-  }
-
-  #[cfg(feature = "mmap")]
-  pub fn read_at_sync(&self, offset: u64, len: u64) -> Vec<u8> {
-    let offset = usz!(offset);
-    let len = usz!(len);
-    let memory = unsafe { std::slice::from_raw_parts(self.mmap.as_ptr(), self.mmap_len) };
-    memory[offset..offset + len].to_vec()
   }
 
   fn bump_write_metrics(&self, len: u64, call_us: u64) {
@@ -249,53 +219,6 @@ impl SeekableAsyncFile {
       .fetch_add(call_us, Ordering::Relaxed);
   }
 
-  #[cfg(feature = "tokio_file")]
-  pub async fn write_at(&self, offset: u64, data: Vec<u8>) {
-    let fd = self.fd.clone();
-    let len: u64 = data.len().try_into().unwrap();
-    let started = Instant::now();
-    spawn_blocking(move || fd.write_all_at(&data, offset).unwrap())
-      .await
-      .unwrap();
-    // Yes, we're including the overhead of Tokio's spawn_blocking.
-    let call_us: u64 = started.elapsed().as_micros().try_into().unwrap();
-    self.bump_write_metrics(len, call_us);
-  }
-
-  #[cfg(feature = "mmap")]
-  pub async fn write_at(&self, offset: u64, data: Vec<u8>) {
-    let offset = usz!(offset);
-    let len = data.len();
-    let started = Instant::now();
-
-    let mmap = self.mmap.clone();
-    let mmap_len = self.mmap_len;
-    spawn_blocking(move || {
-      let memory = unsafe { std::slice::from_raw_parts_mut(mmap.as_mut_ptr(), mmap_len) };
-      memory[offset..offset + len].copy_from_slice(&data);
-    })
-    .await
-    .unwrap();
-
-    // This could be significant e.g. page fault.
-    let call_us: u64 = started.elapsed().as_micros().try_into().unwrap();
-    self.bump_write_metrics(len.try_into().unwrap(), call_us);
-  }
-
-  #[cfg(feature = "mmap")]
-  pub fn write_at_sync(&self, offset: u64, data: Vec<u8>) {
-    let offset = usz!(offset);
-    let len = data.len();
-    let started = Instant::now();
-
-    let memory = unsafe { std::slice::from_raw_parts_mut(self.mmap.as_mut_ptr(), self.mmap_len) };
-    memory[offset..offset + len].copy_from_slice(&data);
-
-    // This could be significant e.g. page fault.
-    let call_us: u64 = started.elapsed().as_micros().try_into().unwrap();
-    self.bump_write_metrics(len.try_into().unwrap(), call_us);
-  }
-
   pub async fn write_at_with_delayed_sync(&self, writes: Vec<WriteRequest>) {
     let count: u64 = writes.len().try_into().unwrap();
     let mut deduplicated = vec![];
@@ -303,7 +226,7 @@ impl SeekableAsyncFile {
       match w.deduplicate_seq {
         Some(_) => deduplicated.push(w),
         // TODO Can we make this concurrent?
-        None => self.write_at(w.offset, w.data).await,
+        None => Off64AsyncWrite::write_at(self, w.offset, w.data).await,
       };
     }
 
@@ -397,7 +320,7 @@ impl SeekableAsyncFile {
 
         iter(deduplicated_writes.drain(..))
           .for_each_concurrent(None, |(offset, data)| async move {
-            self.write_at(offset, data).await;
+            Off64AsyncWrite::write_at(self, offset, data).await;
           })
           .await;
 
@@ -438,5 +361,96 @@ impl SeekableAsyncFile {
       .metrics
       .sync_us_counter
       .fetch_add(sync_us, Ordering::Relaxed);
+  }
+}
+
+#[cfg(feature = "mmap")]
+impl<'a> Off64Read<'a, Vec<u8>> for SeekableAsyncFile {
+  fn read_at(&self, offset: u64, len: u64) -> Vec<u8> {
+    let offset = usz!(offset);
+    let len = usz!(len);
+    let memory = unsafe { std::slice::from_raw_parts(self.mmap.as_ptr(), self.mmap_len) };
+    memory[offset..offset + len].to_vec()
+  }
+}
+
+#[cfg(feature = "mmap")]
+impl<'a> Off64Write<Vec<u8>> for SeekableAsyncFile {
+  fn write_at<'v>(&self, offset: u64, data: Vec<u8>) -> () {
+    let offset = usz!(offset);
+    let len = data.len();
+    let started = Instant::now();
+
+    let memory = unsafe { std::slice::from_raw_parts_mut(self.mmap.as_mut_ptr(), self.mmap_len) };
+    memory[offset..offset + len].copy_from_slice(&data);
+
+    // This could be significant e.g. page fault.
+    let call_us: u64 = started.elapsed().as_micros().try_into().unwrap();
+    self.bump_write_metrics(len.try_into().unwrap(), call_us);
+  }
+}
+
+#[async_trait]
+impl<'a> Off64AsyncRead<'a, Vec<u8>> for SeekableAsyncFile {
+  #[cfg(feature = "mmap")]
+  async fn read_at(&self, offset: u64, len: u64) -> Vec<u8> {
+    let offset = usz!(offset);
+    let len = usz!(len);
+    let mmap = self.mmap.clone();
+    let mmap_len = self.mmap_len;
+    spawn_blocking(move || {
+      let memory = unsafe { std::slice::from_raw_parts(mmap.as_ptr(), mmap_len) };
+      memory[offset..offset + len].to_vec()
+    })
+    .await
+    .unwrap()
+  }
+
+  #[cfg(feature = "tokio_file")]
+  async fn read_at(&self, offset: u64, len: u64) -> Vec<u8> {
+    let fd = self.fd.clone();
+    spawn_blocking(move || {
+      let mut buf = vec![0u8; len.try_into().unwrap()];
+      fd.read_exact_at(&mut buf, offset).unwrap();
+      buf
+    })
+    .await
+    .unwrap()
+  }
+}
+
+#[async_trait]
+impl Off64AsyncWrite<Vec<u8>> for SeekableAsyncFile {
+  #[cfg(feature = "mmap")]
+  async fn write_at(&self, offset: u64, data: Vec<u8>) {
+    let offset = usz!(offset);
+    let len = data.len();
+    let started = Instant::now();
+
+    let mmap = self.mmap.clone();
+    let mmap_len = self.mmap_len;
+    spawn_blocking(move || {
+      let memory = unsafe { std::slice::from_raw_parts_mut(mmap.as_mut_ptr(), mmap_len) };
+      memory[offset..offset + len].copy_from_slice(&data);
+    })
+    .await
+    .unwrap();
+
+    // This could be significant e.g. page fault.
+    let call_us: u64 = started.elapsed().as_micros().try_into().unwrap();
+    self.bump_write_metrics(len.try_into().unwrap(), call_us);
+  }
+
+  #[cfg(feature = "tokio_file")]
+  async fn write_at(&self, offset: u64, data: Vec<u8>) {
+    let fd = self.fd.clone();
+    let len: u64 = data.len().try_into().unwrap();
+    let started = Instant::now();
+    spawn_blocking(move || fd.write_all_at(&data, offset).unwrap())
+      .await
+      .unwrap();
+    // Yes, we're including the overhead of Tokio's spawn_blocking.
+    let call_us: u64 = started.elapsed().as_micros().try_into().unwrap();
+    self.bump_write_metrics(len, call_us);
   }
 }
