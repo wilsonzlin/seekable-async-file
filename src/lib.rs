@@ -1,6 +1,4 @@
 use async_trait::async_trait;
-use futures::stream::iter;
-use futures::StreamExt;
 use off64::chrono::Off64AsyncReadChrono;
 use off64::chrono::Off64AsyncWriteChrono;
 use off64::chrono::Off64ReadChrono;
@@ -16,7 +14,6 @@ use off64::Off64Read;
 use off64::Off64Write;
 use signal_future::SignalFuture;
 use signal_future::SignalFutureController;
-use std::collections::HashMap;
 use std::io::SeekFrom;
 #[cfg(feature = "tokio_file")]
 use std::os::unix::prelude::FileExt;
@@ -45,42 +42,21 @@ fn dur_us(dur: Instant) -> u64 {
 }
 
 /// Data to write and the offset to write it at. This is provided to `write_at_with_delayed_sync`.
-pub struct WriteRequest {
-  data: Vec<u8>,
+pub struct WriteRequest<D: AsRef<[u8]> + Send + 'static> {
+  data: D,
   offset: u64,
-  deduplicate_seq: Option<u64>,
 }
 
-impl WriteRequest {
-  pub fn new(offset: u64, data: Vec<u8>) -> Self {
-    Self {
-      data,
-      offset,
-      deduplicate_seq: None,
-    }
+impl<D: AsRef<[u8]> + Send + 'static> WriteRequest<D> {
+  pub fn new(offset: u64, data: D) -> Self {
+    Self { data, offset }
   }
-
-  // POSIX write(2) calls can be reordered between fdatasync/fsync calls, so sequential writes to the same offset may not result in the last being the winner. Normally, writes to the same offset don't occur before a sync as that would be clobbering an unconfirmed change, but sometimes this is needed. Provide this variant to `write_at_with_delayed_sync` (not `write_at`), the write will be recorded (but delayed) and then applied on the next scheduled fdatasync, and the write with the highest `seq` to an offset will always win. In addition, sometimes use of async will also make it difficult to ensure ordering; therefore, a `seq` should also be provided so that any call with a less `seq` than the highest seen `seq` of all previous calls are ignored. If this is unnecessary/unwanted, always provide the same `seq` value (e.g. 0).
-  pub fn deduplicated(offset: u64, seq: u64, data: Vec<u8>) -> Self {
-    Self {
-      data,
-      offset,
-      deduplicate_seq: Some(seq),
-    }
-  }
-}
-
-#[derive(Default)]
-struct PendingDeduplicatedWrites {
-  data: HashMap<u64, Vec<u8>>,
-  seen_seq: HashMap<u64, u64>,
 }
 
 struct PendingSyncState {
   earliest_unsynced: Option<Instant>, // Only set when first pending_sync_fut_states is created; otherwise, metrics are misleading as we'd count time when no one is waiting for a sync as delayed sync time.
   latest_unsynced: Option<Instant>,
   pending_sync_fut_states: Vec<SignalFutureController>,
-  pending_deduplicated_writes: PendingDeduplicatedWrites,
 }
 
 /// Metrics populated by a `SeekableAsyncFile`. There should be exactly one per `SeekableAsyncFile`; don't share between multiple `SeekableAsyncFile` values.
@@ -200,7 +176,6 @@ impl SeekableAsyncFile {
         earliest_unsynced: None,
         latest_unsynced: None,
         pending_sync_fut_states: Vec::new(),
-        pending_deduplicated_writes: PendingDeduplicatedWrites::default(),
       })),
     }
   }
@@ -262,16 +237,16 @@ impl SeekableAsyncFile {
   }
 
   #[cfg(feature = "mmap")]
-  pub async fn write_at(&self, offset: u64, data: Vec<u8>) {
+  pub async fn write_at<D: AsRef<[u8]> + Send + 'static>(&self, offset: u64, data: D) {
     let offset = usz!(offset);
-    let len = data.len();
+    let len = data.as_ref().len();
     let started = Instant::now();
 
     let mmap = self.mmap.clone();
     let mmap_len = self.mmap_len;
     spawn_blocking(move || {
       let memory = unsafe { std::slice::from_raw_parts_mut(mmap.as_mut_ptr(), mmap_len) };
-      memory[offset..offset + len].copy_from_slice(&data);
+      memory[offset..offset + len].copy_from_slice(data.as_ref());
     })
     .await
     .unwrap();
@@ -282,13 +257,13 @@ impl SeekableAsyncFile {
   }
 
   #[cfg(feature = "mmap")]
-  pub fn write_at_sync(&self, offset: u64, data: Vec<u8>) -> () {
+  pub fn write_at_sync<D: AsRef<[u8]> + Send + 'static>(&self, offset: u64, data: D) -> () {
     let offset = usz!(offset);
-    let len = data.len();
+    let len = data.as_ref().len();
     let started = Instant::now();
 
     let memory = unsafe { std::slice::from_raw_parts_mut(self.mmap.as_mut_ptr(), self.mmap_len) };
-    memory[offset..offset + len].copy_from_slice(&data);
+    memory[offset..offset + len].copy_from_slice(data.as_ref());
 
     // This could be significant e.g. page fault.
     let call_us: u64 = started.elapsed().as_micros().try_into().unwrap();
@@ -296,11 +271,11 @@ impl SeekableAsyncFile {
   }
 
   #[cfg(feature = "tokio_file")]
-  pub async fn write_at(&self, offset: u64, data: Vec<u8>) {
+  pub async fn write_at<D: AsRef<[u8]> + Send + 'static>(&self, offset: u64, data: D) {
     let fd = self.fd.clone();
-    let len: u64 = data.len().try_into().unwrap();
+    let len: u64 = data.as_ref().len().try_into().unwrap();
     let started = Instant::now();
-    spawn_blocking(move || fd.write_all_at(&data, offset).unwrap())
+    spawn_blocking(move || fd.write_all_at(data.as_ref(), offset).unwrap())
       .await
       .unwrap();
     // Yes, we're including the overhead of Tokio's spawn_blocking.
@@ -308,16 +283,15 @@ impl SeekableAsyncFile {
     self.bump_write_metrics(len, call_us);
   }
 
-  pub async fn write_at_with_delayed_sync(&self, writes: Vec<WriteRequest>) {
+  pub async fn write_at_with_delayed_sync<D: AsRef<[u8]> + Send + 'static>(
+    &self,
+    writes: Vec<WriteRequest<D>>,
+  ) {
     let count: u64 = writes.len().try_into().unwrap();
-    let mut deduplicated = vec![];
+    // WARNING: If we're using mmap, we cannot make this concurrent as that would make writes out of order, and caller may require writes to clobber each other sequentially, not nondeterministically.
+    // TODO For File, we could write concurrently, as writes are not guaranteed to be ordered anyway. However, caller may still want to depend on platform-specific guarantees of ordered writes if available.
     for w in writes {
-      match w.deduplicate_seq {
-        Some(_) => deduplicated.push(w),
-        // WARNING: If we're using mmap, we cannot make this concurrent as that would make writes out of order, and caller may require writes to clobber each other sequentially, not nondeterministically.
-        // TODO For File, we could write concurrently, as writes are not guaranteed to be ordered anyway. However, caller may still want to depend on platform-specific guarantees of ordered writes if available.
-        None => self.write_at(w.offset, w.data).await,
-      };
+      self.write_at(w.offset, w.data).await;
     }
 
     let (fut, fut_ctl) = SignalFuture::new();
@@ -328,25 +302,6 @@ impl SeekableAsyncFile {
       state.earliest_unsynced.get_or_insert(now);
       state.latest_unsynced = Some(now);
       state.pending_sync_fut_states.push(fut_ctl.clone());
-
-      for w in deduplicated {
-        if state
-          .pending_deduplicated_writes
-          .seen_seq
-          .get(&w.offset)
-          .filter(|s| **s > w.deduplicate_seq.unwrap())
-          .is_none()
-        {
-          state
-            .pending_deduplicated_writes
-            .data
-            .insert(w.offset, w.data);
-          state
-            .pending_deduplicated_writes
-            .seen_seq
-            .insert(w.offset, w.deduplicate_seq.unwrap());
-        };
-      }
     };
 
     self
@@ -360,7 +315,6 @@ impl SeekableAsyncFile {
   pub async fn start_delayed_data_sync_background_loop(&self) {
     // Store these outside and reuse them to avoid reallocations on each loop.
     let mut futures_to_wake = Vec::new();
-    let mut deduplicated_writes = Vec::new();
     loop {
       sleep(std::time::Duration::from_micros(self.sync_delay_us)).await;
 
@@ -372,9 +326,7 @@ impl SeekableAsyncFile {
       let sync_now = {
         let mut state = self.pending_sync_state.lock().await;
 
-        if !state.pending_sync_fut_states.is_empty()
-          || !state.pending_deduplicated_writes.data.is_empty()
-        {
+        if !state.pending_sync_fut_states.is_empty() {
           let longest_delay_us = dur_us(state.earliest_unsynced.unwrap());
           let shortest_delay_us = dur_us(state.latest_unsynced.unwrap());
 
@@ -382,7 +334,6 @@ impl SeekableAsyncFile {
           state.latest_unsynced = None;
 
           futures_to_wake.extend(state.pending_sync_fut_states.drain(..));
-          deduplicated_writes.extend(state.pending_deduplicated_writes.data.drain());
 
           Some(SyncNow {
             longest_delay_us,
@@ -407,12 +358,6 @@ impl SeekableAsyncFile {
           .metrics
           .sync_shortest_delay_us_counter
           .fetch_add(shortest_delay_us, Ordering::Relaxed);
-
-        iter(deduplicated_writes.drain(..))
-          .for_each_concurrent(None, |(offset, data)| async move {
-            self.write_at(offset, data).await;
-          })
-          .await;
 
         self.sync_data().await;
 
