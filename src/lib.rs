@@ -314,7 +314,8 @@ impl SeekableAsyncFile {
     for w in writes {
       match w.deduplicate_seq {
         Some(_) => deduplicated.push(w),
-        // TODO Can we make this concurrent?
+        // WARNING: If we're using mmap, we cannot make this concurrent as that would make writes out of order, and caller may require writes to clobber each other sequentially, not nondeterministically.
+        // TODO For File, we could write concurrently, as writes are not guaranteed to be ordered anyway. However, caller may still want to depend on platform-specific guarantees of ordered writes if available.
         None => self.write_at(w.offset, w.data).await,
       };
     }
