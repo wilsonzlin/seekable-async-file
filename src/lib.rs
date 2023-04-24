@@ -22,6 +22,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use tinybuf::TinyBuf;
 use tokio::fs::File;
 use tokio::fs::OpenOptions;
 use tokio::io;
@@ -203,29 +204,29 @@ impl SeekableAsyncFile {
   }
 
   #[cfg(feature = "mmap")]
-  pub async fn read_at(&self, offset: u64, len: u64) -> Vec<u8> {
+  pub async fn read_at(&self, offset: u64, len: u64) -> TinyBuf {
     let offset = usz!(offset);
     let len = usz!(len);
     let mmap = self.mmap.clone();
     let mmap_len = self.mmap_len;
     spawn_blocking(move || {
       let memory = unsafe { std::slice::from_raw_parts(mmap.as_ptr(), mmap_len) };
-      memory[offset..offset + len].to_vec()
+      TinyBuf::from_slice(&memory[offset..offset + len])
     })
     .await
     .unwrap()
   }
 
   #[cfg(feature = "mmap")]
-  pub fn read_at_sync(&self, offset: u64, len: u64) -> Vec<u8> {
+  pub fn read_at_sync(&self, offset: u64, len: u64) -> TinyBuf {
     let offset = usz!(offset);
     let len = usz!(len);
     let memory = unsafe { std::slice::from_raw_parts(self.mmap.as_ptr(), self.mmap_len) };
-    memory[offset..offset + len].to_vec()
+    TinyBuf::from_slice(&memory[offset..offset + len])
   }
 
   #[cfg(feature = "tokio_file")]
-  pub async fn read_at(&self, offset: u64, len: u64) -> Vec<u8> {
+  pub async fn read_at(&self, offset: u64, len: u64) -> TinyBuf {
     let fd = self.fd.clone();
     spawn_blocking(move || {
       let mut buf = vec![0u8; len.try_into().unwrap()];
@@ -400,20 +401,20 @@ impl SeekableAsyncFile {
 }
 
 #[cfg(feature = "mmap")]
-impl<'a> Off64Read<'a, Vec<u8>> for SeekableAsyncFile {
-  fn read_at(&'a self, offset: u64, len: u64) -> Vec<u8> {
+impl<'a> Off64Read<'a, TinyBuf> for SeekableAsyncFile {
+  fn read_at(&'a self, offset: u64, len: u64) -> TinyBuf {
     self.read_at_sync(offset, len)
   }
 }
 #[cfg(feature = "mmap")]
-impl<'a> Off64ReadChrono<'a, Vec<u8>> for SeekableAsyncFile {}
+impl<'a> Off64ReadChrono<'a, TinyBuf> for SeekableAsyncFile {}
 #[cfg(feature = "mmap")]
-impl<'a> Off64ReadInt<'a, Vec<u8>> for SeekableAsyncFile {}
+impl<'a> Off64ReadInt<'a, TinyBuf> for SeekableAsyncFile {}
 
 #[cfg(feature = "mmap")]
 impl Off64Write for SeekableAsyncFile {
   fn write_at(&self, offset: u64, value: &[u8]) -> () {
-    self.write_at_sync(offset, value.to_vec())
+    self.write_at_sync(offset, TinyBuf::from_slice(value))
   }
 }
 #[cfg(feature = "mmap")]
@@ -422,18 +423,18 @@ impl Off64WriteChrono for SeekableAsyncFile {}
 impl Off64WriteInt for SeekableAsyncFile {}
 
 #[async_trait]
-impl<'a> Off64AsyncRead<'a, Vec<u8>> for SeekableAsyncFile {
-  async fn read_at(&self, offset: u64, len: u64) -> Vec<u8> {
+impl<'a> Off64AsyncRead<'a, TinyBuf> for SeekableAsyncFile {
+  async fn read_at(&self, offset: u64, len: u64) -> TinyBuf {
     SeekableAsyncFile::read_at(self, offset, len).await
   }
 }
-impl<'a> Off64AsyncReadChrono<'a, Vec<u8>> for SeekableAsyncFile {}
-impl<'a> Off64AsyncReadInt<'a, Vec<u8>> for SeekableAsyncFile {}
+impl<'a> Off64AsyncReadChrono<'a, TinyBuf> for SeekableAsyncFile {}
+impl<'a> Off64AsyncReadInt<'a, TinyBuf> for SeekableAsyncFile {}
 
 #[async_trait]
 impl Off64AsyncWrite for SeekableAsyncFile {
   async fn write_at(&self, offset: u64, value: &[u8]) {
-    SeekableAsyncFile::write_at(self, offset, value.to_vec()).await
+    SeekableAsyncFile::write_at(self, offset, TinyBuf::from_slice(value)).await
   }
 }
 impl Off64AsyncWriteChrono for SeekableAsyncFile {}

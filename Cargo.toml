@@ -24,4 +24,5 @@ futures = "0.3"
 memmap2 = { version = "0.5", optional = true }
 off64 = "0.6"
 signal-future = "0.0.1"
+tinybuf = "0.1.0"
 tokio = { version = "1", features = ["fs", "io-util", "rt", "sync", "time"] }
