@@ -286,12 +286,13 @@ impl SeekableAsyncFile {
 
   pub async fn write_at_with_delayed_sync<D: AsRef<[u8]> + Send + 'static>(
     &self,
-    writes: Vec<WriteRequest<D>>,
+    writes: impl IntoIterator<Item = WriteRequest<D>>,
   ) {
-    let count: u64 = writes.len().try_into().unwrap();
+    let mut count: u64 = 0;
     // WARNING: If we're using mmap, we cannot make this concurrent as that would make writes out of order, and caller may require writes to clobber each other sequentially, not nondeterministically.
     // TODO For File, we could write concurrently, as writes are not guaranteed to be ordered anyway. However, caller may still want to depend on platform-specific guarantees of ordered writes if available.
     for w in writes {
+      count += 1;
       self.write_at(w.offset, w.data).await;
     }
 
