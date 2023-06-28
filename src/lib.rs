@@ -235,6 +235,7 @@ impl SeekableAsyncFile {
     })
     .await
     .unwrap()
+    .into()
   }
 
   #[cfg(feature = "mmap")]
